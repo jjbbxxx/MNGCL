@@ -48,6 +48,7 @@ def main():
     parser.add_argument('--cancer_type', type=str, default='pan-cancer', help='癌症类型')
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints', help='checkpoint 文件夹')
     parser.add_argument('--out',         type=str, default='predictions.csv', help='输出文件')
+    parser.add_argument('--input_file', type=str, default=None, help='上传的输入 CSV 文件路径')
     args = parser.parse_args()
 
     # 1. 加载配置
@@ -59,21 +60,27 @@ def main():
     dataPath = os.path.join('data', args.dataset)
     data = torch.load(os.path.join(dataPath, f"{args.dataset}_data.pkl")).to(device)
 
-    # 根据癌症类型截取特征
-    if args.cancer_type == 'pan-cancer':
-        data.x = data.x[:, :48]
+    # 如果指定了上传的输入文件，则优先读取该文件作为 data.x
+    if args.input_file:
+        import pandas as pd
+        print(f"检测到上传文件，读取 {args.input_file}")
+        input_data = pd.read_csv(args.input_file).values
+        data.x = torch.tensor(input_data, dtype=torch.float32).to(device)
     else:
-        cancerType_dict = {
-            'kirc':[0,16,32],'brca':[1,17,33],'prad':[3,19,35],'stad':[4,20,36],
-            'hnsc':[5,21,37],'luad':[6,22,38],'thca':[7,23,39],'blca':[8,24,40],
-            'esca':[9,25,41],'lihc':[10,26,42],'ucec':[11,27,43],'coad':[12,28,44],
-            'lusc':[13,29,45],'cesc':[14,30,46],'kirp':[15,31,47]
-        }
-        data.x = data.x[:, cancerType_dict[args.cancer_type]]
-
-    # 拼接 node2vec 特征
-    dataz = torch.load(os.path.join(dataPath, "Str_feature.pkl"), map_location='cpu').to(device)
-    data.x = torch.cat((data.x, dataz), dim=1)
+        # 根据癌症类型截取特征
+        if args.cancer_type == 'pan-cancer':
+            data.x = data.x[:, :48]
+        else:
+            cancerType_dict = {
+                'kirc':[0,16,32],'brca':[1,17,33],'prad':[3,19,35],'stad':[4,20,36],
+                'hnsc':[5,21,37],'luad':[6,22,38],'thca':[7,23,39],'blca':[8,24,40],
+                'esca':[9,25,41],'lihc':[10,26,42],'ucec':[11,27,43],'coad':[12,28,44],
+                'lusc':[13,29,45],'cesc':[14,30,46],'kirp':[15,31,47]
+            }
+            data.x = data.x[:, cancerType_dict[args.cancer_type]]
+        # 拼接 node2vec 特征
+        dataz = torch.load(os.path.join(dataPath, "Str_feature.pkl"), map_location='cpu').to(device)
+        data.x = torch.cat((data.x, dataz), dim=1)
 
     # 加载邻接矩阵
     ppiAdj   = torch.load(os.path.join(dataPath, 'ppi.pkl'), map_location='cpu')
