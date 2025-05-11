@@ -1,66 +1,118 @@
 import os
-import logging
-from logging.handlers import RotatingFileHandler
-from flask import Flask, Response, stream_with_context
+from flask import Flask, Response, stream_with_context, request, jsonify
 from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, UserMixin, login_user, logout_user, current_user
 import subprocess, re, pandas as pd, json
+from werkzeug.security import generate_password_hash, check_password_hash
 
-# —— 全局日志配置 —— #
-LOG_FILE = os.path.join(os.path.dirname(__file__), 'app.log')
-logger = logging.getLogger('my_flask_app')
-logger.setLevel(logging.DEBUG)
-rotating_handler = RotatingFileHandler(LOG_FILE, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
-formatter = logging.Formatter('[%(asctime)s] %(levelname)s in %(module)s: %(message)s')
-rotating_handler.setFormatter(formatter)
-logger.addHandler(rotating_handler)
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
-
-# —— Flask 应用 —— #
+# —— Flask 应用 & 配置 —— #
 app = Flask(__name__)
-CORS(app, supports_credentials=True, resources={r"/*": {"origins": "*"}})
-app.logger = logger
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'change-this-secret')
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///app.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+# CORS 允许前端跨域携带凭证
+CORS(app, resources={r"/api/*": {"origins": ["http://localhost:8080"], "methods": ["GET", "POST", "OPTIONS"], "allow_headers": "*"}}, supports_credentials=True)
 
+# —— 扩展初始化 —— #
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+
+# —— 用户模型 —— #
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(150), unique=True, nullable=False)
+    password_hash = db.Column(db.String(128), nullable=False)
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+# —— 认证接口 —— #
+@app.route('/api/register', methods=['POST', 'OPTIONS'])
+def api_register():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    data = request.get_json() or {}
+    username = data.get('username')
+    password = data.get('password')
+    if not username or not password:
+        return jsonify({'error': '用户名和密码均为必填'}), 400
+    if User.query.filter_by(username=username).first():
+        return jsonify({'error': '用户名已存在'}), 400
+    user = User(username=username)
+    user.set_password(password)
+    db.session.add(user)
+    db.session.commit()
+    login_user(user)
+    return jsonify({'message': '注册并登录成功'})
+
+@app.route('/api/login', methods=['POST', 'OPTIONS'])
+def api_login():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    data = request.get_json() or {}
+    username = data.get('username')
+    password = data.get('password')
+    if not username or not password:
+        return jsonify({'error': '用户名和密码均为必填'}), 400
+    user = User.query.filter_by(username=username).first()
+    if user and user.check_password(password):
+        login_user(user)
+        return jsonify({'message': '登录成功'})
+    return jsonify({'error': '用户名或密码错误'}), 401
+
+@app.route('/api/logout', methods=['POST', 'OPTIONS'])
+def api_logout():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    logout_user()
+    return jsonify({'message': '已登出'})
+
+@app.route('/api/check_auth', methods=['GET', 'OPTIONS'])
+def api_check_auth():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    return jsonify({'logged_in': current_user.is_authenticated})
+
+# —— 预测接口 —— #
 BASE_DIR = os.path.dirname(__file__)
 CSV_PATH = os.path.join(BASE_DIR, 'predictions.csv')
 
 @app.route('/api/predict_stream', methods=['GET'])
 def predict_stream():
     def generate():
-        app.logger.debug(">>> 使用的 predictions.csv 路径: %s", CSV_PATH)
-        # 1. 如果已有 CSV，直接返回 done 事件，不跑脚本
+        # 如果已有 CSV，则直接返回结果
         if os.path.exists(CSV_PATH):
-            app.logger.debug("检测到已存在 %s，直接返回结果，不重复跑脚本", CSV_PATH)
-            records = pd.read_csv(CSV_PATH).to_dict(orient='records')
+            records = pd.read_csv(CSV_PATH, encoding='utf-8').to_dict(orient='records')
             yield f"event: done\ndata: {json.dumps(records, ensure_ascii=False)}\n\n"
             return
-
-        # 2. 否则启动 predict.py，实时推送进度
-        app.logger.debug("未检测到 %s，开始执行 predict.py", CSV_PATH)
+        # 否则启动 predict.py 并推送进度
         proc = subprocess.Popen(
             ['python', '-u', os.path.join(BASE_DIR, 'predict.py')],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1
         )
         for line in proc.stdout:
-            app.logger.debug("predict.py 输出：%s", line.strip())
             m = re.search(r'Embedding:\s*(\d+)%', line)
             if m:
                 yield f"event: progress\ndata: {m.group(1)}\n\n"
         proc.wait()
-
-        # 3. 脚本执行完，再读 CSV 并发送 done
+        # 读取 CSV 并返回
         try:
-            records = pd.read_csv(CSV_PATH).to_dict(orient='records')
-        except Exception as e:
-            app.logger.error("读取 %s 失败：%s", CSV_PATH, e)
+            records = pd.read_csv(CSV_PATH, encoding='utf-8').to_dict(orient='records')
+        except Exception:
             yield f"event: error\ndata: 读取预测结果失败\n\n"
             return
-
         yield f"event: done\ndata: {json.dumps(records, ensure_ascii=False)}\n\n"
-
     return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
+# —— 启动 —— #
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=5000, debug=True, use_reloader=False)
+    with app.app_context():
+        db.create_all()
+    app.run(host='0.0.0.0', port=5050, debug=True)
