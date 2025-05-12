@@ -98,14 +98,20 @@ def api_logout():
     logout_user()
     return jsonify({'message': '已登出'})
 
-@app.route('/api/check_auth', methods=['GET', 'OPTIONS'])
+@app.route('/api/check_auth', methods=['GET'])
 def api_check_auth():
-    if request.method == 'OPTIONS':
-        return jsonify({}), 200
-    return jsonify({
-        'logged_in': current_user.is_authenticated,
-        'is_admin': getattr(current_user, 'is_admin', False)
-    })
+    if current_user.is_authenticated:
+        return jsonify({
+            'logged_in': True,
+            'username': current_user.username,
+            'is_admin': current_user.is_admin
+        })
+    else:
+        return jsonify({
+            'logged_in': False,
+            'username': None,
+            'is_admin': False
+        })
 
 
 # —— 预测接口 —— #
@@ -225,22 +231,32 @@ def change_password():
     db.session.commit()
     return jsonify({'message': '密码修改成功'})
 
-@app.route('/api/predictions', methods=['GET'])
-def api_list_predictions():
-    # 仅管理员可访问
-    if not current_user.is_authenticated or not current_user.is_admin:
-        return jsonify({'error': '权限不足'}), 403
 
-    preds = Prediction.query.order_by(Prediction.timestamp.desc()).all()
-    result = []
-    for p in preds:
-        result.append({
-            'id': p.id,
-            'username': p.user.username,
-            'timestamp': p.timestamp.isoformat(),
-            'csv_url': url_for('download_csv', _external=True, prediction_id=p.id)
-        })
-    return jsonify(result)
+@app.route('/api/predictions', methods=['GET'])
+def api_predictions():
+    if not current_user.is_authenticated:
+        return jsonify({'error': '未登录'}), 403
+
+    if current_user.is_admin:
+        # 如果是管理员，返回所有预测记录，并包含用户名
+        predictions = db.session.query(Prediction, User.username).join(User, Prediction.user_id == User.id).all()
+    else:
+        # 如果是普通用户，返回该用户自己的预测记录
+        predictions = db.session.query(Prediction, User.username).join(User, Prediction.user_id == User.id).filter(
+            Prediction.user_id == current_user.id).all()
+
+    # 将数据转化为字典并返回
+    predictions_data = [
+        {
+            'id': pred.id,
+            'username': username,  # 返回用户名
+            'csv_path': pred.csv_path,
+            'timestamp': pred.timestamp
+        }
+        for pred, username in predictions
+    ]
+
+    return jsonify(predictions_data)
 
 
 
