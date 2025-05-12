@@ -1,5 +1,5 @@
 import os
-from flask import Flask, Response, stream_with_context, request, jsonify
+from flask import Flask, Response, stream_with_context, request, jsonify, send_file
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, logout_user, current_user
@@ -100,6 +100,7 @@ BASE_DIR = os.path.dirname(__file__)
 CSV_PATH = os.path.join(BASE_DIR, 'predictions.csv')
 
 @app.route('/api/predict_stream', methods=['GET'])
+@app.route('/api/predict_stream', methods=['GET'])
 def predict_stream():
     def generate():
         # 如果已有 CSV，则直接返回结果
@@ -107,6 +108,7 @@ def predict_stream():
             records = pd.read_csv(CSV_PATH, encoding='utf-8').to_dict(orient='records')
             yield f"event: done\ndata: {json.dumps(records, ensure_ascii=False)}\n\n"
             return
+
         # 否则启动 predict.py 并推送进度
         proc = subprocess.Popen(
             ['python', '-u', os.path.join(BASE_DIR, 'predict.py')],
@@ -118,6 +120,7 @@ def predict_stream():
             if m:
                 yield f"event: progress\ndata: {m.group(1)}\n\n"
         proc.wait()
+
         # 读取 CSV 并返回
         try:
             records = pd.read_csv(CSV_PATH, encoding='utf-8').to_dict(orient='records')
@@ -125,7 +128,17 @@ def predict_stream():
             yield f"event: error\ndata: 读取预测结果失败\n\n"
             return
         yield f"event: done\ndata: {json.dumps(records, ensure_ascii=False)}\n\n"
+
     return Response(stream_with_context(generate()), mimetype='text/event-stream')
+
+
+# 新增接口：允许用户下载预测结果的 CSV 文件
+@app.route('/api/download_csv', methods=['GET'])
+def download_csv():
+    if os.path.exists(CSV_PATH):
+        return send_file(CSV_PATH, as_attachment=True, download_name="predictions.csv")
+    else:
+        return jsonify({"error": "CSV 文件未找到"}), 404
 
 @app.route('/api/users', methods=['GET'])
 @admin_required
