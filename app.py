@@ -1,12 +1,17 @@
+import json
 import os
-from flask import Flask, Response, stream_with_context, request, jsonify, send_file
-from flask_cors import CORS
-from flask_sqlalchemy import SQLAlchemy
-from flask_login import LoginManager, UserMixin, login_user, logout_user, current_user
-import subprocess, re, pandas as pd, json
-from werkzeug.security import generate_password_hash, check_password_hash
-from flask_login import login_required
+import pandas as pd
+import re
+import subprocess
+from datetime import datetime
 from functools import wraps
+
+from flask import Flask, Response, stream_with_context, request, jsonify, send_file, url_for
+from flask_cors import CORS
+from flask_login import LoginManager, UserMixin, login_user, logout_user, current_user
+from flask_login import login_required
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # —— Flask 应用 & 配置 —— #
 app = Flask(__name__)
@@ -39,6 +44,14 @@ def admin_required(f):
             return jsonify({'error': '权限不足'}), 403
         return f(*args, **kwargs)
     return decorated
+
+class Prediction(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    csv_path = db.Column(db.String(256), nullable=False)     # 保存文件的服务器路径
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)  # 保存时间
+
+    user = db.relationship('User', backref=db.backref('predictions', lazy=True))
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -99,12 +112,14 @@ def api_check_auth():
 BASE_DIR = os.path.dirname(__file__)
 CSV_PATH = os.path.join(BASE_DIR, 'predictions.csv')
 
-@app.route('/api/predict_stream', methods=['GET'])
+
 @app.route('/api/predict_stream', methods=['GET'])
 def predict_stream():
     def generate():
-        # 如果已有 CSV，则直接返回结果
+        # 如果已有 CSV，则直接返回结果（并记录一次，但避免重复写入）
         if os.path.exists(CSV_PATH):
+            # 记录预测（仅当未记录时）
+            _maybe_record_prediction()
             records = pd.read_csv(CSV_PATH, encoding='utf-8').to_dict(orient='records')
             yield f"event: done\ndata: {json.dumps(records, ensure_ascii=False)}\n\n"
             return
@@ -121,15 +136,38 @@ def predict_stream():
                 yield f"event: progress\ndata: {m.group(1)}\n\n"
         proc.wait()
 
-        # 读取 CSV 并返回
+        # 读取 CSV 并返回，同时写入预测记录
         try:
             records = pd.read_csv(CSV_PATH, encoding='utf-8').to_dict(orient='records')
         except Exception:
             yield f"event: error\ndata: 读取预测结果失败\n\n"
             return
+
+        # 写入 Prediction 表
+        _maybe_record_prediction()
+
         yield f"event: done\ndata: {json.dumps(records, ensure_ascii=False)}\n\n"
 
     return Response(stream_with_context(generate()), mimetype='text/event-stream')
+
+
+def _maybe_record_prediction():
+    """如果当前用户未对这个 CSV 路径写过记录，就写一条预测记录。"""
+    # 当前用户必须已登录
+    if not current_user.is_authenticated:
+        return
+
+    # 检查是否已有相同文件的记录，避免重复写入
+    exists = Prediction.query.filter_by(user_id=current_user.id, csv_path=CSV_PATH).first()
+    if exists:
+        return
+
+    pred = Prediction(
+        user_id=current_user.id,
+        csv_path=CSV_PATH
+    )
+    db.session.add(pred)
+    db.session.commit()
 
 
 # 新增接口：允许用户下载预测结果的 CSV 文件
@@ -139,6 +177,15 @@ def download_csv():
         return send_file(CSV_PATH, as_attachment=True, download_name="predictions.csv")
     else:
         return jsonify({"error": "CSV 文件未找到"}), 404
+
+@app.route('/api/download_csv/<int:prediction_id>', methods=['GET'])
+def download_prediction_csv(prediction_id):
+    pred = Prediction.query.get_or_404(prediction_id)
+    # 只有管理员或本人可以下载
+    if not current_user.is_authenticated or (not current_user.is_admin and current_user.id != pred.user_id):
+        return jsonify({'error': '权限不足'}), 403
+    return send_file(pred.csv_path, as_attachment=True, download_name=f'prediction_{prediction_id}.csv')
+
 
 @app.route('/api/users', methods=['GET'])
 @admin_required
@@ -159,6 +206,42 @@ def api_update_user(user_id):
         u.is_admin = bool(data['is_admin'])
         db.session.commit()
     return jsonify({'id': u.id, 'is_admin': u.is_admin})
+
+@app.route('/api/change_password', methods=['POST'])
+@login_required
+def change_password():
+    data = request.get_json() or {}
+    old = data.get('old_password')
+    new = data.get('new_password')
+
+    if not old or not new:
+        return jsonify({'error': '旧密码和新密码都是必填'}), 400
+
+    user = current_user
+    if not user.check_password(old):
+        return jsonify({'error': '旧密码错误'}), 400
+
+    user.set_password(new)
+    db.session.commit()
+    return jsonify({'message': '密码修改成功'})
+
+@app.route('/api/predictions', methods=['GET'])
+def api_list_predictions():
+    # 仅管理员可访问
+    if not current_user.is_authenticated or not current_user.is_admin:
+        return jsonify({'error': '权限不足'}), 403
+
+    preds = Prediction.query.order_by(Prediction.timestamp.desc()).all()
+    result = []
+    for p in preds:
+        result.append({
+            'id': p.id,
+            'username': p.user.username,
+            'timestamp': p.timestamp.isoformat(),
+            'csv_url': url_for('download_csv', _external=True, prediction_id=p.id)
+        })
+    return jsonify(result)
+
 
 
 # —— 启动 —— #
