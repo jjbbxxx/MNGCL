@@ -53,6 +53,16 @@ class Prediction(db.Model):
 
     user = db.relationship('User', backref=db.backref('predictions', lazy=True))
 
+class Annotation(db.Model):
+    __tablename__ = 'annotation'
+    id = db.Column(db.Integer, primary_key=True)
+    prediction_id = db.Column(db.Integer, db.ForeignKey('prediction.id'), nullable=False)
+    gene_index   = db.Column(db.Integer, nullable=False)
+    comment      = db.Column(db.Text, nullable=False)
+    timestamp    = db.Column(db.DateTime, default=datetime.utcnow)
+
+    prediction = db.relationship('Prediction', backref=db.backref('annotations', lazy='dynamic'))
+
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
@@ -257,6 +267,50 @@ def api_predictions():
     ]
 
     return jsonify(predictions_data)
+
+@app.route('/api/predictions/<int:pid>/annotations', methods=['GET'])
+@login_required
+def get_annotations(pid):
+    pred = Prediction.query.get_or_404(pid)
+    # 普通用户只能看自己的预测批注
+    if not current_user.is_admin and pred.user_id != current_user.id:
+        return jsonify({'error': '权限不足'}), 403
+
+    annos = Annotation.query.filter_by(prediction_id=pid).order_by(Annotation.timestamp).all()
+    return jsonify([
+        {
+            'gene_index': a.gene_index,
+            'comment': a.comment,
+            'timestamp': a.timestamp.isoformat()
+        }
+        for a in annos
+    ])
+
+# 对某次预测的某个基因添加/更新批注
+@app.route('/api/predictions/<int:pid>/annotations', methods=['POST'])
+@login_required
+def add_annotation(pid):
+    data = request.get_json() or {}
+    gi = data.get('gene_index')
+    comment = data.get('comment', '').strip()
+    if gi is None or comment == '':
+        return jsonify({'error': 'gene_index 和 comment 都必填'}), 400
+
+    pred = Prediction.query.get_or_404(pid)
+    if not current_user.is_admin and pred.user_id != current_user.id:
+        return jsonify({'error': '权限不足'}), 403
+
+    # 如果同一个基因已有批注，就更新，否则新增
+    anno = Annotation.query.filter_by(prediction_id=pid, gene_index=gi).first()
+    if not anno:
+        anno = Annotation(prediction_id=pid, gene_index=gi, comment=comment)
+        db.session.add(anno)
+    else:
+        anno.comment = comment
+        anno.timestamp = datetime.utcnow()
+    db.session.commit()
+
+    return jsonify({'message': '批注已保存'})
 
 
 
